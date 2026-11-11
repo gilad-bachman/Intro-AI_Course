@@ -1,3 +1,11 @@
+# AI/source disclosure: developed with Claude and OpenAI Codex for state design,
+# admissible heuristics, pruning, code implementation, and testing.
+# Online ideas consulted: Wehrle et al., IJCAI 2015 (symmetry/partial-order
+# reduction), https://ijcai.org/proceedings/2015/244; Paul et al., SOCS 2017,
+# https://ojs.aaai.org/index.php/SOCS/article/download/18428/18219/21944.
+# Implementations below are original adaptations; capacities and fixed A* remain
+# governed by Assignment1.pdf. No stored plans or problem-name detection.
+
 import heapq
 import ex1_check
 import search
@@ -7,7 +15,7 @@ id = ["No numbers - I'm special!"]
 
 
 
-class LogisticsProblem(search.Problem):
+class _MapProblem(search.Problem):
     """This class implements a logistics problem"""
 
     # Position tags. A position is a tuple (tag, value):
@@ -71,6 +79,19 @@ class LogisticsProblem(search.Problem):
         # Roads that cut the map (roads + ferries) in two, used for forced drives
         self._compute_forced_roads()
 
+        # Components of the FULL transport map, including ferry links. Actions
+        # in different components affect disjoint objects and commute.
+        self.transport_component = [-1] * self.num_locations
+        component = 0
+        for src in range(self.num_locations):
+            if self.transport_component[src] != -1:
+                continue
+            for dst, distance in enumerate(self.dist[src]):
+                if distance != float('inf'):
+                    self.transport_component[dst] = component
+            component += 1
+        self.num_transport_components = component
+
         # Memoized heuristic values per state (see h_astar)
         self._h_cache = {}
 
@@ -78,6 +99,7 @@ class LogisticsProblem(search.Problem):
         self.package_ids = tuple(sorted(initial["Packages"]))
         self.truck_ids = tuple(sorted(initial["Trucks"]))
         self.ferry_ids = tuple(sorted(initial["Ferries"]))
+        self._compute_packing_bounds()
 
         # ---- Dynamic data (the state) ----
         # state = (packages, trucks, ferries), each a tuple of (id, position)
@@ -93,139 +115,6 @@ class LogisticsProblem(search.Problem):
         """ Do not change this. Returns the cost of reaching state2 from state1 via action,
         given cost c to reach state1: SAIL costs 3, every other action costs 1"""
         return c + (3 if action.startswith("SAIL") else 1)
-
-    def successor(self, state):
-        """ Generates the successor states returns [(action, achieved_states, ...)]"""
-        packages, trucks, ferries = state
-        truck_pos = dict(trucks)
-        ferry_port = dict(ferries)
-
-        # Pruning: if a package is inside a truck standing at the package's goal,
-        # unloading it now is never worse than anything else (any optimal plan
-        # can be reordered to do it first, and it only frees capacity), so it is
-        # the only successor generated.
-        for i, (p, pos) in enumerate(packages):
-            if pos[0] == self.IN:
-                t = pos[1]
-                tpos = truck_pos[t]
-                if tpos[0] == self.AT and tpos[1] == self.package_goal[p]:
-                    new_packages = self._replace(packages, i, p, tpos)
-                    return [("UNLOAD{%d,%d}" % (p, t), (new_packages, trucks, ferries))]
-
-        # Current load of every truck and number of trucks aboard every ferry
-        truck_load = {t: 0 for t in self.truck_ids}
-        for p, pos in packages:
-            if pos[0] == self.IN:
-                truck_load[pos[1]] += self.package_weight[p]
-        ferry_count = {f: 0 for f in self.ferry_ids}
-        for t, pos in trucks:
-            if pos[0] == self.ON:
-                ferry_count[pos[1]] += 1
-
-        result = []
-
-        # Locations where a truck is standing (not aboard a ferry)
-        standing_at = {pos[1] for _, pos in trucks if pos[0] == self.AT}
-
-        # ---- Ferries: SAIL ----
-        for i, (f, port) in enumerate(ferries):
-            empty_ferry = ferry_count[f] == 0
-            for port2 in self.ferry_ports[f]:
-                if port2 != port:
-                    # Pruning (P1): an empty ferry only sails to a port where a
-                    # truck is standing. An empty sail only serves a later BOARD
-                    # at its destination; it can be postponed to just before that
-                    # BOARD, when the boarding truck stands there (and two empty
-                    # sails in a row can be merged into one).
-                    if empty_ferry and port2 not in standing_at:
-                        continue
-                    new_ferries = self._replace(ferries, i, f, port2)
-                    result.append(("SAIL{%d,%d,%d}" % (f, port, port2),
-                                   (packages, trucks, new_ferries)))
-
-        # ---- Packages: LOAD / UNLOAD ----
-        for i, (p, pos) in enumerate(packages):
-            if pos[0] == self.AT:
-                # Pruning: a package lying at its goal is never loaded again
-                if pos[1] == self.package_goal[p]:
-                    continue
-                # LOAD into any truck standing at the same location with room
-                for t in self.truck_ids:
-                    if (truck_pos[t] == pos and
-                            truck_load[t] + self.package_weight[p] <= self.truck_capacity[t]):
-                        new_packages = self._replace(packages, i, p, (self.IN, t))
-                        result.append(("LOAD{%d,%d}" % (p, t),
-                                       (new_packages, trucks, ferries)))
-            else:
-                # UNLOAD only if its truck is standing at a location
-                t = pos[1]
-                tpos = truck_pos[t]
-                if tpos[0] == self.AT:
-                    new_packages = self._replace(packages, i, p, tpos)
-                    result.append(("UNLOAD{%d,%d}" % (p, t),
-                                   (new_packages, trucks, ferries)))
-
-        # Locations where something still has to happen: undelivered packages
-        # lying there, and goals of undelivered packages
-        useful = set()
-        pickups = set()     # locations with an undelivered package lying there
-        for p, pos in packages:
-            goal = self.package_goal[p]
-            if pos[0] == self.AT:
-                if pos[1] != goal:
-                    useful.add(pos[1])
-                    useful.add(goal)
-                    pickups.add(pos[1])
-            else:
-                useful.add(goal)
-        # Where an empty truck may be heading: a package to pick up, or a port
-        empty_targets = pickups | self.ferry_served_ports
-        road_dist = self.road_dist
-
-        # ---- Trucks: DRIVE / BOARD / DISEMBARK ----
-        cut_far = self.cut_far
-        for i, (t, pos) in enumerate(trucks):
-            if pos[0] == self.AT:
-                l = pos[1]
-                # Pruning (P2): an empty truck only drives one step along a
-                # shortest road path toward a target (a package to pick up, or a
-                # port). An empty truck drives only to LOAD or BOARD somewhere;
-                # its drives can be postponed to just before that action and
-                # replaced by a shortest road path, which is never more expensive.
-                if truck_load[t] == 0:
-                    here = road_dist[l]
-                    toward = [x for x in empty_targets if here[x] != float('inf')]
-                else:
-                    toward = None
-                for l2 in self.neighbors[l]:
-                    if toward is not None:
-                        there = road_dist[l2]
-                        if not any(there[x] == here[x] - 1 for x in toward):
-                            continue
-                    # Pruning: never drive across a cut road into a region where
-                    # nothing has to happen (no package to pick up, no goal).
-                    # Anything a truck could do in there (e.g. drop a package off
-                    # for another truck) can be done at the entrance instead.
-                    far = cut_far.get((l, l2))
-                    if far is not None and far.isdisjoint(useful):
-                        continue
-                    new_trucks = self._replace(trucks, i, t, (self.AT, l2))
-                    result.append(("DRIVE{%d,%d,%d}" % (t, l, l2),
-                                   (packages, new_trucks, ferries)))
-                # BOARD any ferry docked here that still has room
-                for f in self.ferry_ids:
-                    if ferry_port[f] == l and ferry_count[f] < self.ferry_capacity[f]:
-                        new_trucks = self._replace(trucks, i, t, (self.ON, f))
-                        result.append(("BOARD{%d,%d}" % (t, f),
-                                       (packages, new_trucks, ferries)))
-            else:
-                # DISEMBARK at the port where its ferry is docked
-                f = pos[1]
-                new_trucks = self._replace(trucks, i, t, (self.AT, ferry_port[f]))
-                result.append(("DISEMBARK{%d,%d}" % (t, f),
-                               (packages, new_trucks, ferries)))
-
-        return result
 
     def _compute_distances(self, crossing_cost):
         """All-pairs shortest distances on a graph of the locations:
@@ -433,6 +322,18 @@ class LogisticsProblem(search.Problem):
         # (truck locations, package location) -> directions every truck must
         # drive to reach the package (see h_astar); cleared if it grows too big
         self._reach_cache = {}
+        # Bit d says a truck at this location can start a drive in cut direction
+        # d. Combining trucks' masks answers the common "any truck on this
+        # side?" test without scanning all trucks for every cut road.
+        self._cut_direction_bits = tuple(1 << d for d in range(2 * len(self.cut_side)))
+        self._cut_even_mask = sum(self._cut_direction_bits[::2])
+        self._truck_cut_masks = []
+        for loc in range(n):
+            mask = 0
+            for road, side in enumerate(self.cut_side):
+                if side[loc] != -1:
+                    mask |= self._cut_direction_bits[2 * road + side[loc]]
+            self._truck_cut_masks.append(mask)
 
         # (u, v) -> locations on v's side of cut road u-v: the region a truck
         # enters by driving u -> v (it can only enter and leave through u-v)
@@ -521,7 +422,59 @@ class LogisticsProblem(search.Problem):
                     key[y] = d
         return total
 
-    def _sail_lower_bound(self, remaining_islands, ferry_port):
+    def _compute_packing_bounds(self):
+        """Minimum loads for subsets in a relaxed fleet of C_max trucks.
+
+        This is subset dynamic programming on package weights, not a search
+        over logistics states. For each subset retain the fewest loads and,
+        among ties, the lightest last load. Adding its final package either
+        fits in that load or opens one new load. Unlimited copies of the
+        largest truck only make the real problem easier.
+
+        Bound the exponential precomputation to 16 packages. Larger problems
+        retain the existing admissible weight bounds. If every subset already
+        meets the weight-division bound, disable runtime packing work entirely.
+        """
+        self._packing_loads = None
+        self._package_bits = {}
+        cap = self.max_truck_capacity
+        weights = [self.package_weight[p] for p in self.package_ids]
+        n = len(weights)
+        if (not n or n > 16 or cap <= 0 or max(weights) > cap or
+                sum(weights) <= cap or
+                (len(set(weights)) == 1 and weights[0] > 0 and cap % weights[0] == 0)):
+            return
+        size = 1 << n
+        loads = [0] * size
+        last = [0] * size
+        total = [0] * size
+        improves = False
+        for subset in range(1, size):
+            bit = subset & -subset
+            total[subset] = total[subset ^ bit] + weights[bit.bit_length() - 1]
+            best_count, best_last = n + 1, 0
+            pending = subset
+            while pending:
+                bit = pending & -pending
+                pending ^= bit
+                previous = subset ^ bit
+                weight = weights[bit.bit_length() - 1]
+                count, used = loads[previous], last[previous]
+                if count == 0 or used + weight > cap:
+                    count += 1
+                    used = weight
+                else:
+                    used += weight
+                if count < best_count or (count == best_count and used < best_last):
+                    best_count, best_last = count, used
+            loads[subset], last[subset] = best_count, best_last
+            if best_count > -(-total[subset] // cap):
+                improves = True
+        if improves:
+            self._packing_loads = loads
+            self._package_bits = {p: 1 << i for i, p in enumerate(self.package_ids)}
+
+    def _sail_lower_bound(self, remaining_islands, ferry_port, package_masks=None):
         """Returns (lower bound on SAIL actions still needed, lower bound on truck
         rides still needed).
         Rides: every package that changes island rides in trucks on ferries, at
@@ -544,23 +497,38 @@ class LogisticsProblem(search.Problem):
         # still to do, and one SAIL does at most max_sail_capacity of them.
         workload = 0
         ride_workload = 0
+        # Two packages heavier than half a container cannot share it. Their
+        # required sails/rides therefore count separately, without choosing a
+        # particular route. This supplements the fractional weight bound.
+        heavy_sails = 0
+        heavy_rides = 0
         for i, j, w in remaining_islands:
             if i != j:
                 workload += w * self.island_hops[i][j]
                 ride_workload += w * self.island_rides[i][j]
+                if 2 * w > self.max_sail_capacity:
+                    heavy_sails += self.island_hops[i][j]
+                if 2 * w > self.max_truck_capacity:
+                    heavy_rides += self.island_rides[i][j]
         cap = self.max_sail_capacity
         by_workload = -(-workload // cap) if cap > 0 and workload else 0
         c_max = self.max_truck_capacity
         rides_by_workload = (-(-ride_workload // c_max)
                              if c_max > 0 and ride_workload else 0)
+        by_workload = max(by_workload, heavy_sails)
+        rides_by_workload = max(rides_by_workload, heavy_rides)
 
         # Bound 2: forced crossings (below). Both bound the total number of
         # SAILs, so the answer is the larger of the two.
         needed = {}                         # crossing -> weight forced through it
-        for i, j, w in remaining_islands:
+        packing = self._packing_loads if package_masks is not None else None
+        for index, (i, j, w) in enumerate(remaining_islands):
             if i != j:
                 for c in self.forced.get((i, j), ()):
-                    needed[c] = needed.get(c, 0) + w
+                    if packing is None:
+                        needed[c] = needed.get(c, 0) + w
+                    else:
+                        needed[c] = needed.get(c, 0) | package_masks[index]
         if not needed:
             return by_workload, rides_by_workload
 
@@ -569,7 +537,8 @@ class LogisticsProblem(search.Problem):
         # groups never do (add them up).
         group_rides = {}
         for c, weight in needed.items():
-            r = -(-weight // c_max) if c_max > 0 else 1
+            r = (packing[weight] if packing is not None else
+                 (-(-weight // c_max) if c_max > 0 else 1))
             g = self.crossing_group[c]
             if r > group_rides.get(g, 0):
                 group_rides[g] = r
@@ -579,7 +548,11 @@ class LogisticsProblem(search.Problem):
         sails = 0
         for c, weight in needed.items():
             per_sail = self.crossing_capacity[c]
-            trips = -(-weight // per_sail) if per_sail > 0 else 1
+            if packing is not None and per_sail > 0:
+                trucks_per_sail = per_sail // c_max
+                trips = -(-packing[weight] // trucks_per_sail)
+            else:
+                trips = -(-weight // per_sail) if per_sail > 0 else 1
             sails += trips if trips > 1 else 1
         island = self.island
         arrive = {y for (_, y) in needed}
@@ -591,19 +564,6 @@ class LogisticsProblem(search.Problem):
                 late.add(x)
         by_forced = sails + len(late)
         return (by_forced if by_forced > by_workload else by_workload), rides
-
-    @staticmethod
-    def _replace(entries, i, obj_id, new_pos):
-        """Return a copy of the (id, position) tuple with entry i set to new_pos"""
-        return entries[:i] + ((obj_id, new_pos),) + entries[i + 1:]
-
-    def goal_test(self, state):
-        """ given a state, checks if this is the goal state, compares to the created goal state returns True/False"""
-        packages = state[0]
-        for p, pos in packages:
-            if pos != (self.AT, self.package_goal[p]):
-                return False
-        return True
 
     def h_astar(self, node):
         """ This is the heuristic. It gets a node (not a state)
@@ -680,9 +640,10 @@ class LogisticsProblem(search.Problem):
         shared_max_drive = 0
         solo_sum_drive = 0
         islands = []        # (current island, goal island) per remaining package
-        # directed cut road -> total weight of packages forced through it.
-        # A direction with weight 0 is one some truck must drive just to reach
-        # a package.
+        packing = self._packing_loads
+        package_masks = [] if packing is not None else None
+        # Directed cut road -> package subset if packing helps this instance,
+        # otherwise total weight. Zero also marks pickup-only directions.
         forced = {}
         must_visit = set()  # locations some truck must still stand at
         truck_locs = frozenset(truck_at[t][0] for t in self.truck_ids)
@@ -715,8 +676,14 @@ class LogisticsProblem(search.Problem):
                 here = island[loc]
             # Cut roads every route of this package to its goal uses: the
             # package's weight must be carried across each of them
-            for d in self._forced_drives(loc, goal):
-                forced[d] = forced_get(d, 0) + w
+            if packing is None:
+                for d in self._forced_drives(loc, goal):
+                    forced[d] = forced_get(d, 0) + w
+            else:
+                bit = self._package_bits[p]
+                for d in self._forced_drives(loc, goal):
+                    forced[d] = forced_get(d, 0) | bit
+                package_masks.append(bit)
             # A truck must stand at the goal to UNLOAD, and at a lying package's
             # location to LOAD it
             must_visit.add(goal)
@@ -749,14 +716,65 @@ class LogisticsProblem(search.Problem):
         # truck capacity, so a direction that W weight must cross needs at least
         # ceil(W / cap) DRIVE actions (at least 1 if a truck must use it at all).
         # Different directions are different actions, so the counts add up.
-        forced_drives = 0
-        if cap > 0:
-            for weight in forced.values():
-                trips = -(-weight // cap)
-                forced_drives += trips if trips > 1 else 1
-        else:
+        # With at most one trip per direction in a connected map, returns
+        # cannot strengthen the existing bound: a package on a side with no
+        # truck already forces a pickup drive in the reverse direction. Skip
+        # the extra accounting in that case (notably when all packages fit in
+        # one truck, as on x4).
+        packed_trips = ({d: max(1, packing[subset]) for d, subset in forced.items()}
+                        if packing is not None else None)
+        single_trip = (max(packed_trips.values(), default=0) <= 1
+                       if packed_trips is not None else
+                       cap > 0 and max(forced.values(), default=0) <= cap)
+        if self.num_transport_components == 1 and single_trip:
             forced_drives = len(forced)
-        sails, rides = self._sail_lower_bound(islands, ferry_port)
+        else:
+            crossing_trips = {}
+            forced_drives = required_mask = repeated_mask = 0
+            repeated = []
+            bits = self._cut_direction_bits
+            for direction, weight in forced.items():
+                trips = (packed_trips[direction] if packed_trips is not None else
+                         (-(-weight // cap) if cap > 0 else 1))
+                if trips < 1:
+                    trips = 1
+                crossing_trips[direction] = trips
+                forced_drives += trips
+                required_mask |= bits[direction]
+                if trips > 1:
+                    repeated.append((direction, trips))
+                    repeated_mask |= bits[direction]
+            # Conservation across a cut road: if a departures from side 0 are
+            # required and only T0 trucks are there now, at least a-T0 reverse
+            # drives must supply the remaining trucks. The reverse deliveries can
+            # do that job, so use max, never add the two requirements. Ferries
+            # cannot bypass a cut road (cuts were computed on the full map).
+            occupied_sides = 0
+            if crossing_trips:
+                for location, _ in truck_at.values():
+                    occupied_sides |= self._truck_cut_masks[location]
+            # Swap adjacent bits to identify directions with reverse deliveries.
+            # For a direction used once, a return is forced exactly when neither a
+            # truck nor a required reverse crossing can supply that departure.
+            reverse_mask = ((required_mask & self._cut_even_mask) << 1 |
+                            (required_mask & ~self._cut_even_mask) >> 1)
+            forced_drives += (required_mask & ~repeated_mask &
+                              ~reverse_mask & ~occupied_sides).bit_count()
+            # Only directions requiring several trips need actual truck counts.
+            for direction, departures in repeated:
+                shortage = departures - crossing_trips.get(direction ^ 1, 0)
+                if shortage <= 0:
+                    continue
+                departure_side = direction & 1
+                side = self.cut_side[direction // 2]
+                for location, _ in truck_at.values():
+                    if side[location] == departure_side:
+                        shortage -= 1
+                        if shortage == 0:
+                            break
+                if shortage > 0:
+                    forced_drives += shortage
+        sails, rides = self._sail_lower_bound(islands, ferry_port, package_masks)
         # Every ride ends with a DISEMBARK and starts with a BOARD, except rides
         # already under way (at most one per truck already aboard a ferry).
         aboard = sum(1 for t in truck_ids if truck_at[t][1] is not None)
@@ -785,10 +803,321 @@ class LogisticsProblem(search.Problem):
         return load_unload + movement_ns + 3 * sails
 
 
+
+class State:
+    __slots__=('data','key','aliases','_hash')
+    def __init__(self,data,key,aliases):
+        object.__setattr__(self,'data',data)
+        object.__setattr__(self,'key',key)
+        object.__setattr__(self,'aliases',aliases)
+        object.__setattr__(self,'_hash',hash(key))
+    def __setattr__(self,k,v):raise AttributeError('immutable state')
+    def __hash__(self):return self._hash
+    def __eq__(self,other):return isinstance(other,State) and self.key==other.key
+
+class _CompactProblem(_MapProblem):
+    def __init__(self,game):
+        super().__init__(game)
+        self.P=len(self.package_ids);self.T=len(self.truck_ids);self.F=len(self.ferry_ids);self.N=self.num_locations
+        self.ws=tuple(self.package_weight[p] for p in self.package_ids)
+        self.gs=tuple(self.package_goal[p] for p in self.package_ids)
+        self.cs=tuple(self.truck_capacity[t] for t in self.truck_ids)
+        self.ks=tuple(self.ferry_capacity[f] for f in self.ferry_ids)
+        self.fs=tuple(tuple(sorted(self.ferry_ports[f])) for f in self.ferry_ids)
+        def groups(values):
+            d={}
+            for i,value in enumerate(values):d.setdefault(value,[]).append(i)
+            return tuple(tuple(g) for g in d.values())
+        self.pgroups=groups(tuple(zip(self.ws,self.gs)))
+        self.tgroups=groups(self.cs)
+        self.fgroups=groups(tuple(zip(self.fs,self.ks)))
+        self.pclass=tuple(next(j for j,g in enumerate(self.pgroups) if i in g) for i in range(self.P))
+        self.fclass=tuple(next(j for j,g in enumerate(self.fgroups) if i in g) for i in range(self.F))
+        self._tree_setup()
+        # Peel transport-map dead ends with no initial truck/package or goal.
+        adj=[set(self.neighbors[v]) for v in range(self.N)]
+        for served in self.fs:
+            for v in served:adj[v].update(w for w in served if w!=v)
+        terminals={v[0] for v in game['Trucks'].values()}|{v[0] for v in game['Packages'].values()}|set(self.gs)
+        pending=[v for v in range(self.N) if len(adj[v])<=1 and v not in terminals]
+        removed=set()
+        while pending:
+            v=pending.pop()
+            if v in removed:continue
+            removed.add(v)
+            for w in list(adj[v]):
+                adj[w].discard(v)
+                if len(adj[w])<=1 and w not in terminals:pending.append(w)
+            adj[v].clear()
+        self.dead_locations=removed
+        self.useful_ferries=frozenset(f for f,ports in enumerate(self.fs) if len(set(ports)-removed)>=2)
+        data=tuple(game['Packages'][p][0] for p in self.package_ids)+tuple(game['Trucks'][t][0] for t in self.truck_ids)+tuple(game['Ferries'][f][0] for f in self.ferry_ids)
+        aliases=(self.package_ids,self.truck_ids,self.ferry_ids,tuple(range(self.N)))
+        self.initial=self._state(data,aliases)
+        self._h_cache={}
+
+    def _tree_setup(self):
+        anchors=set(self.gs)|set(self.ferry_served_ports)
+        done=set();children=[[] for _ in range(self.N)];roots=[];order=[]
+        for start in range(self.N):
+            if start in done:continue
+            comp={start};stack=[start]
+            while stack:
+                v=stack.pop()
+                for w in self.neighbors[v]:
+                    if w not in comp:comp.add(w);stack.append(w)
+            done.update(comp)
+            if sum(len(self.neighbors[v]) for v in comp)!=2*(len(comp)-1):continue
+            root=min(comp&anchors) if comp&anchors else min(comp);roots.append(root)
+            stack=[(root,-1)]
+            while stack:
+                v,parent=stack.pop();order.append(v)
+                children[v]=[w for w in self.neighbors[v] if w!=parent]
+                stack.extend((w,v) for w in children[v])
+        shapes=[-1]*self.N;intern={};enabled=False
+        for v in reversed(order):
+            key=(v if v in anchors else -1,tuple(sorted(shapes[w] for w in children[v])))
+            shapes[v]=intern.setdefault(key,len(intern))
+            cs=[shapes[w] for w in children[v]]
+            if len(cs)!=len(set(cs)) and (self.N<=24 or any(cs.count(c)>=3 for c in cs)):enabled=True
+        self.tree_enabled=enabled
+        self.tree_children=children;self.tree_roots=roots;self.tree_order=order;self.tree_shapes=shapes
+        self.tree_fixed_children=tuple(tuple(sorted(cs,key=lambda w:(shapes[w],w))) for cs in children)
+
+    def _state(self,data,aliases):
+        P,T,F,N=self.P,self.T,self.F,self.N
+        q=data[:P];tr=data[P:P+T];fe=data[P+T:]
+        cargo=[[] for _ in range(T)];ground=[]
+        for i,pos in enumerate(q):
+            if pos>=N:cargo[pos-N].append(self.pclass[i])
+            else:ground.append((self.pclass[i],pos))
+        cargo=[tuple(sorted(x)) for x in cargo]
+        lm=None
+        if self.tree_enabled:
+            pq=[[] for _ in range(N)];tq=[[] for _ in range(N)]
+            for c,pos in ground:pq[pos].append(c)
+            for t,pos in enumerate(tr):
+                if pos<N:tq[pos].append((self.cs[t],cargo[t]))
+            dyn=[None]*N;children=self.tree_children;shape=self.tree_shapes
+            for v in reversed(self.tree_order):
+                dyn[v]=(tuple(sorted(pq[v])),tuple(sorted(tq[v])),tuple(sorted((shape[w],dyn[w]) for w in children[v])))
+            lm=list(range(N));stack=[(v,v) for v in self.tree_roots]
+            while stack:
+                v,target=stack.pop();lm[v]=target
+                stack.extend(zip(sorted(children[v],key=lambda w:(shape[w],dyn[w])),self.tree_fixed_children[target]))
+        aboard=[[] for _ in range(F)];standing=[]
+        for t,pos in enumerate(tr):
+            if pos>=N:aboard[pos-N].append((self.cs[t],cargo[t]))
+            else:standing.append((self.cs[t],pos if lm is None else lm[pos],cargo[t]))
+        if lm is not None:ground=[(c,lm[pos]) for c,pos in ground]
+        ships=tuple(sorted((self.fclass[f],port,tuple(sorted(aboard[f]))) for f,port in enumerate(fe)))
+        key=(tuple(sorted(ground)),tuple(sorted(standing)),ships)
+        return State(data,key,aliases)
+
+    def _h_value(self,state):
+        P,T,N=self.P,self.T,self.N;data=state.data
+        packages=tuple((p,(self.AT,x) if x<N else (self.IN,self.truck_ids[x-N])) for p,x in zip(self.package_ids,data[:P]))
+        trucks=tuple((t,(self.AT,x) if x<N else (self.ON,self.ferry_ids[x-N])) for t,x in zip(self.truck_ids,data[P:P+T]))
+        ferries=tuple(zip(self.ferry_ids,data[P+T:]))
+        return super()._h_value((packages,trucks,ferries))
+
+    def goal_test(self,state):return state.data[:self.P]==self.gs
+
+    def successor(self,state):
+        P,T,N=self.P,self.T,self.N;data=state.data
+        q=data[:P];tr=data[P:P+T];fe=data[P+T:]
+        pa,ta,fa,la=state.aliases
+        def change(i,x):return self._state(data[:i]+(x,)+data[i+1:],state.aliases)
+        for p,pos in enumerate(q):
+            if pos>=N and tr[pos-N]<N and tr[pos-N]==self.gs[p]:
+                t=pos-N
+                return [(f'UNLOAD{{{pa[p]},{ta[t]}}}',change(p,tr[t]))]
+        active=None
+        if self.num_transport_components>1:
+            active=min((self.transport_component[self.gs[p]] for p in range(P) if q[p]!=self.gs[p]),default=None)
+        load=[0]*T;count=[0]*self.F
+        for p,pos in enumerate(q):
+            if pos>=N:load[pos-N]+=self.ws[p]
+        for pos in tr:
+            if pos>=N:count[pos-N]+=1
+        standing=set(x for x in tr if x<N)
+        useful=set();pickups=set()
+        for p,pos in enumerate(q):
+            if pos==self.gs[p]:continue
+            useful.add(self.gs[p])
+            if pos<N:useful.add(pos);pickups.add(pos)
+        targets=pickups|self.ferry_served_ports
+        out={}
+        def add(action,i,x):
+            child=change(i,x)
+            if child==state:return
+            old=out.get(child)
+            if old is None or (old[0].startswith('SAIL') and not action.startswith('SAIL')):out[child]=(action,child)
+        for f,port in enumerate(fe):
+            if f not in self.useful_ferries:continue
+            if active is not None and self.transport_component[port]!=active:continue
+            for target in self.fs[f]:
+                if target not in self.dead_locations and target!=port and (count[f] or target in standing):
+                    add(f'SAIL{{{fa[f]},{la[port]},{la[target]}}}',P+T+f,target)
+        for p,pos in enumerate(q):
+            if active is not None and self.transport_component[self.gs[p]]!=active:continue
+            if pos<N:
+                if pos==self.gs[p]:continue
+                for t in range(T):
+                    if tr[t]==pos and load[t]+self.ws[p]<=self.cs[t]:add(f'LOAD{{{pa[p]},{ta[t]}}}',p,N+t)
+            else:
+                t=pos-N
+                if tr[t]<N:add(f'UNLOAD{{{pa[p]},{ta[t]}}}',p,tr[t])
+        for t,pos in enumerate(tr):
+            loc=pos if pos<N else fe[pos-N]
+            if active is not None and self.transport_component[loc]!=active:continue
+            if pos<N:
+                toward=None
+                if load[t]==0:
+                    here=self.road_dist[pos];toward=[x for x in targets if here[x]!=float('inf')]
+                for target in self.neighbors[pos]:
+                    if target in self.dead_locations:continue
+                    if toward is not None and not any(self.road_dist[target][x]==here[x]-1 for x in toward):continue
+                    far=self.cut_far.get((pos,target))
+                    if far is not None and far.isdisjoint(useful):continue
+                    add(f'DRIVE{{{ta[t]},{la[pos]},{la[target]}}}',P+t,target)
+                for f,port in enumerate(fe):
+                    if f in self.useful_ferries and port==pos and count[f]<self.ks[f]:add(f'BOARD{{{ta[t]},{fa[f]}}}',P+t,N+f)
+            else:
+                f=pos-N;add(f'DISEMBARK{{{ta[t]},{fa[f]}}}',P+t,fe[f])
+        return list(out.values())
+
+
+class LogisticsProblem(_CompactProblem):
+    def __init__(self,game):
+        super().__init__(game)
+        self._ferry_bound_cache={}
+        groups={}
+        fi={f:i for i,f in enumerate(self.ferry_ids)}
+        for f in self.ferry_ids:
+            cs=[c for c,fs in self.crossing_ferries.items() if f in fs]
+            if cs and fi[f] in self.useful_ferries:groups.setdefault(self.crossing_group[cs[0]],set()).add(fi[f])
+        self.vehicle_regions=[]
+        for members in groups.values():
+            parent=list(range(self.num_islands))
+            def find(i):
+                while parent[i]!=i:i=parent[i]
+                return i
+            for f,ports in enumerate(self.fs):
+                if f in members:continue
+                islands=[self.island[v] for v in ports]
+                for x in islands[1:]:parent[find(x)]=find(islands[0])
+            roots={};region=[]
+            for v in range(self.num_islands):region.append(roots.setdefault(find(v),len(roots)))
+            self.vehicle_regions.append((tuple(region),frozenset(members),len(roots)))
+    def _h_value(self,state):
+        self._bound_data=state.data
+        return super()._h_value(state)
+    def _sail_lower_bound(self,remaining_islands,ferry_port,package_masks=None):
+        P,T,N=self.P,self.T,self.N;data=self._bound_data;q=data[:P];tr=data[P:P+T]
+        stock=[0]*self.num_islands
+        for x in tr:
+            if x<N:stock[self.island[x]]+=1
+        flags=tuple(pos>=N and tr[pos-N]>=N for p,pos in enumerate(q) if pos!=self.gs[p])
+        key=(tuple(remaining_islands),tuple(self.island[ferry_port[f]] for f in self.ferry_ids),tuple(stock),flags)
+        result=self._ferry_bound_cache.get(key)
+        if result is None:
+            result=self._uncached_sail_bound(remaining_islands,ferry_port,package_masks)
+            if len(self._ferry_bound_cache)>200000:self._ferry_bound_cache.clear()
+            self._ferry_bound_cache[key]=result
+        return result
+    def _uncached_sail_bound(self,remaining_islands,ferry_port,package_masks=None):
+        sails,rides=super()._sail_lower_bound(remaining_islands,ferry_port,package_masks)
+        if not self.F:return sails,rides
+        P,T,N=self.P,self.T,self.N;data=self._bound_data;q=data[:P];tr=data[P:P+T];fe=data[P+T:]
+        cap=self.max_truck_capacity
+        if cap<=0:return sails,rides
+        source={};target={};stock=[0]*self.num_islands;aboard=0
+        packing=self._packing_loads
+        for pos in tr:
+            if pos<N:stock[self.island[pos]]+=1
+            else:aboard+=1
+        for p,pos in enumerate(q):
+            if pos==self.gs[p]:continue
+            on_ship=False
+            if pos<N:loc=pos
+            else:
+                t=pos-N;loc=tr[t]
+                if loc>=N:on_ship=True;loc=fe[loc-N]
+            a,b=self.island[loc],self.island[self.gs[p]]
+            payload=self._package_bits[self.package_ids[p]] if packing is not None else self.ws[p]
+            if a!=b and not on_ship:
+                source[a]=(source.get(a,0)|payload) if packing is not None else source.get(a,0)+payload
+            if a!=b or on_ship:
+                target[b]=(target.get(b,0)|payload) if packing is not None else target.get(b,0)+payload
+        def loads(x):return packing[x] if packing is not None else -(-x//cap)
+        # Standing trucks obey initial + DISEMBARK = BOARD + final on each
+        # island. Each first departure and final arrival carries at most C_max.
+        # Any shortage of trucks for departures forces additional disembarks.
+        disembarks=sum(max(loads(target.get(v,0)),loads(source.get(v,0))-stock[v]) for v in range(self.num_islands))
+        rides=max(rides,disembarks)
+        # Cut SETS: remove a ferry group and contract all transport that remains.
+        # A package changing contracted regions needs that group, even if no
+        # individual crossing is forced. Distinct groups use disjoint ferries.
+        group_completed=group_sails=0
+        for region,members,nregions in self.vehicle_regions:
+            sources={};targets={};supply=[0]*nregions;already=0
+            for t,pos in enumerate(tr):
+                if pos>=N and pos-N in members:already+=1;continue
+                loc=pos if pos<N else fe[pos-N]
+                supply[region[self.island[loc]]]+=1
+            for p,pos in enumerate(q):
+                if pos==self.gs[p]:continue
+                on_group=False
+                if pos<N:loc=pos
+                else:
+                    loc=tr[pos-N]
+                    if loc>=N:on_group=loc-N in members;loc=fe[loc-N]
+                a,b=region[self.island[loc]],region[self.island[self.gs[p]]]
+                payload=self._package_bits[self.package_ids[p]] if packing is not None else self.ws[p]
+                if a!=b and not on_group:sources[a]=(sources.get(a,0)|payload) if packing is not None else sources.get(a,0)+payload
+                if a!=b or on_group:targets[b]=(targets.get(b,0)|payload) if packing is not None else targets.get(b,0)+payload
+            completed=sum(max(loads(targets.get(v,0)),loads(sources.get(v,0))-supply[v]) for v in range(nregions))
+            group_completed+=completed
+            group_sails+=-(-max(0,completed-already)//max(self.ks[f] for f in members))
+        rides=max(rides,group_completed)
+        sails=max(sails,group_sails)
+        # In an optimal plan, a completed ride either already began before this
+        # state or has a last SAIL: BOARD...DISEMBARK without sailing is a
+        # positive-cost identity and can be removed. A last SAIL serves at most
+        # max_ferry_capacity completed rides.
+        k=max(self.ks,default=1)
+        sails=max(sails,-(-max(0,rides-aboard)//k))
+        # A unique ferry serving only two islands must alternate sides. Count
+        # its necessary return sails even when the returning sail is empty.
+        needed={}
+        for index,(a,b,w) in enumerate(remaining_islands):
+            if a==b:continue
+            for c in self.forced.get((a,b),()):
+                if packing is not None and package_masks is not None:needed[c]=needed.get(c,0)|package_masks[index]
+                else:needed[c]=needed.get(c,0)+w
+        total=0;done=set()
+        for a,b in needed:
+            if (a,b) in done:continue
+            fs=self.crossing_ferries[(a,b)]
+            def trips(c):
+                payload=needed.get(c,0)
+                if packing is not None and package_masks is not None:
+                    return -(-packing[payload]//max(self.ferry_capacity[f] for f in self.crossing_ferries[c]))
+                capacity=self.crossing_capacity[c]
+                return -(-payload//capacity) if capacity else 0
+            if len(fs)==1:
+                f=next(iter(fs));served={self.island[x] for x in self.ferry_ports[f]}
+                if served=={a,b}:
+                    na,nb=trips((a,b)),trips((b,a))
+                    if self.island[ferry_port[f]]==a:total+=max(0,2*na-1,2*nb)
+                    else:total+=max(0,2*na,2*nb-1)
+                    done.add((a,b));done.add((b,a));continue
+            total+=trips((a,b));done.add((a,b))
+        return max(sails,total),rides
+
+
 def create_logistics_problem(game):
-    print("<<create_logistics_problem")
-    """ Create a logistics problem, based on the description.
-    game - dictionary as described in pdf file"""
     return LogisticsProblem(game)
 
 
