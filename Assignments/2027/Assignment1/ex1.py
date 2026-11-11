@@ -53,6 +53,14 @@ class LogisticsProblem(search.Problem):
         # Used where costs of several packages are added: one SAIL can carry
         # several trucks, so sails must not be added per package.
         self.dist_no_sail = self._compute_distances(crossing_cost=2)
+        # Same, but a crossing costs 0: a lower bound on the DRIVE actions alone
+        # (BOARD/DISEMBARK and SAIL are counted by their own bounds)
+        self.dist_drive = self._compute_distances(crossing_cost=0)
+        # Roads only (no ferries), used to steer empty trucks
+        self.road_dist = self._compute_distances(crossing_cost=None)
+        # Every port some ferry can dock at
+        self.ferry_served_ports = frozenset(
+            p for served in self.ferry_ports.values() for p in served)
 
         # Heaviest load any single truck can carry
         self.max_truck_capacity = max(self.truck_capacity.values(), default=0)
@@ -62,6 +70,9 @@ class LogisticsProblem(search.Problem):
 
         # Roads that cut the map (roads + ferries) in two, used for forced drives
         self._compute_forced_roads()
+
+        # Memoized heuristic values per state (see h_astar)
+        self._h_cache = {}
 
         # Fixed ID order, so every state lists objects in the same order
         self.package_ids = tuple(sorted(initial["Packages"]))
@@ -113,10 +124,21 @@ class LogisticsProblem(search.Problem):
 
         result = []
 
+        # Locations where a truck is standing (not aboard a ferry)
+        standing_at = {pos[1] for _, pos in trucks if pos[0] == self.AT}
+
         # ---- Ferries: SAIL ----
         for i, (f, port) in enumerate(ferries):
+            empty_ferry = ferry_count[f] == 0
             for port2 in self.ferry_ports[f]:
                 if port2 != port:
+                    # Pruning (P1): an empty ferry only sails to a port where a
+                    # truck is standing. An empty sail only serves a later BOARD
+                    # at its destination; it can be postponed to just before that
+                    # BOARD, when the boarding truck stands there (and two empty
+                    # sails in a row can be merged into one).
+                    if empty_ferry and port2 not in standing_at:
+                        continue
                     new_ferries = self._replace(ferries, i, f, port2)
                     result.append(("SAIL{%d,%d,%d}" % (f, port, port2),
                                    (packages, trucks, new_ferries)))
@@ -146,22 +168,40 @@ class LogisticsProblem(search.Problem):
         # Locations where something still has to happen: undelivered packages
         # lying there, and goals of undelivered packages
         useful = set()
+        pickups = set()     # locations with an undelivered package lying there
         for p, pos in packages:
             goal = self.package_goal[p]
             if pos[0] == self.AT:
                 if pos[1] != goal:
                     useful.add(pos[1])
                     useful.add(goal)
+                    pickups.add(pos[1])
             else:
                 useful.add(goal)
+        # Where an empty truck may be heading: a package to pick up, or a port
+        empty_targets = pickups | self.ferry_served_ports
+        road_dist = self.road_dist
 
         # ---- Trucks: DRIVE / BOARD / DISEMBARK ----
         cut_far = self.cut_far
         for i, (t, pos) in enumerate(trucks):
             if pos[0] == self.AT:
                 l = pos[1]
-                # DRIVE along any road from the current location
+                # Pruning (P2): an empty truck only drives one step along a
+                # shortest road path toward a target (a package to pick up, or a
+                # port). An empty truck drives only to LOAD or BOARD somewhere;
+                # its drives can be postponed to just before that action and
+                # replaced by a shortest road path, which is never more expensive.
+                if truck_load[t] == 0:
+                    here = road_dist[l]
+                    toward = [x for x in empty_targets if here[x] != float('inf')]
+                else:
+                    toward = None
                 for l2 in self.neighbors[l]:
+                    if toward is not None:
+                        there = road_dist[l2]
+                        if not any(there[x] == here[x] - 1 for x in toward):
+                            continue
                     # Pruning: never drive across a cut road into a region where
                     # nothing has to happen (no package to pick up, no goal).
                     # Anything a truck could do in there (e.g. drop a package off
@@ -190,13 +230,16 @@ class LogisticsProblem(search.Problem):
     def _compute_distances(self, crossing_cost):
         """All-pairs shortest distances on a graph of the locations:
         every road is an edge of cost 1, and every pair of ports served by the
-        same ferry is an edge of cost crossing_cost. Dijkstra from every location."""
+        same ferry is an edge of cost crossing_cost (no ferry edges if
+        crossing_cost is None). Dijkstra from every location."""
         n = self.num_locations
         edges = {l: {} for l in range(n)}
         for a, b in self.roads:
             edges[a][b] = min(edges[a].get(b, 1), 1)
             edges[b][a] = min(edges[b].get(a, 1), 1)
         for f, served in self.ferry_ports.items():
+            if crossing_cost is None:
+                break
             for a in served:
                 for b in served:
                     if a != b:
@@ -260,6 +303,22 @@ class LogisticsProblem(search.Problem):
         # Most weight any single SAIL can carry anywhere
         self.max_sail_capacity = max(self.crossing_capacity.values(), default=0)
 
+        # Group crossings that share a ferry (transitively). One ride (BOARD ...
+        # DISEMBARK) is on one ferry, so it can only cover crossings of one group.
+        parent = {c: c for c in self.crossings}
+
+        def find(c):
+            while parent[c] != c:
+                parent[c] = parent[parent[c]]
+                c = parent[c]
+            return c
+
+        for f in self.ferry_ports:
+            served = [c for c, fs in self.crossing_ferries.items() if f in fs]
+            for c in served[1:]:
+                parent[find(c)] = find(served[0])
+        self.crossing_group = {c: find(c) for c in self.crossings}
+
         # island_hops[i][j] = fewest crossings (SAILs) from island i to island j
         INF = float('inf')
         hops = [[INF] * k for _ in range(k)]
@@ -275,6 +334,31 @@ class LogisticsProblem(search.Problem):
                             nxt.append(y)
                 frontier = nxt
         self.island_hops = hops
+
+        # island_rides[i][j] = fewest ferry RIDES from island i to island j. A
+        # ride is one truck from BOARD to DISEMBARK on one ferry: it can stay
+        # aboard for several sails, but a ferry sails directly between any two
+        # of its ports, so one ride reaches every island that ferry serves. A new
+        # ride (a new BOARD + DISEMBARK) is needed only to change ferries.
+        ferry_islands = [frozenset(island[p] for p in served)
+                         for served in self.ferry_ports.values()]
+        one_ride = [set() for _ in range(k)]        # islands one ride away
+        for isl in ferry_islands:
+            for a in isl:
+                one_ride[a] |= isl - {a}
+        rides = [[INF] * k for _ in range(k)]
+        for i in range(k):
+            rides[i][i] = 0
+            frontier = [i]
+            while frontier:
+                nxt = []
+                for u in frontier:
+                    for v in one_ride[u]:
+                        if rides[i][v] == INF:
+                            rides[i][v] = rides[i][u] + 1
+                            nxt.append(v)
+                frontier = nxt
+        self.island_rides = rides
 
         def reachable(src, banned):
             seen = {src}
@@ -342,7 +426,13 @@ class LogisticsProblem(search.Problem):
                 side[l] = 1
             self.cut_roads.append((a, b))
             self.cut_side.append(side)
-        self._forced_cache = {}
+        # Lazily filled caches of _forced_drives / _forced_drives_set results,
+        # indexed [src][dst]
+        self._forced_list = [[None] * n for _ in range(n)]
+        self._forced_set = [[None] * n for _ in range(n)]
+        # (truck locations, package location) -> directions every truck must
+        # drive to reach the package (see h_astar); cleared if it grows too big
+        self._reach_cache = {}
 
         # (u, v) -> locations on v's side of cut road u-v: the region a truck
         # enters by driving u -> v (it can only enter and leave through u-v)
@@ -352,22 +442,48 @@ class LogisticsProblem(search.Problem):
             self.cut_far[(b, a)] = frozenset(l for l in range(n) if side[l] == 0)
 
     def _forced_drives(self, src, dst):
-        """Directed cut roads every route from src to dst must drive:
-        a frozenset of (cut road index, direction), direction 0 = first end ->
-        second end, 1 = second end -> first end."""
-        key = (src, dst)
-        res = self._forced_cache.get(key)
+        """Directed cut roads every route from src to dst must drive, as a tuple
+        of ints. A direction is encoded as 2 * (cut road index) + s, where s is
+        the side it starts from (0 = first end -> second end, 1 = the reverse)."""
+        res = self._forced_list[src][dst]
         if res is None:
             out = []
             for i, side in enumerate(self.cut_side):
                 s, d = side[src], side[dst]
                 if s != -1 and d != -1 and s != d:
-                    out.append((i, s))           # from side s toward the other
-            res = frozenset(out)
-            self._forced_cache[key] = res
+                    out.append(2 * i + s)        # from side s toward the other
+            res = tuple(out)
+            self._forced_list[src][dst] = res
         return res
 
-    def _mst_bound(self, points, start_cost):
+    def _forced_drives_set(self, src, dst):
+        """Same as _forced_drives, as a frozenset (for intersections)."""
+        res = self._forced_set[src][dst]
+        if res is None:
+            res = frozenset(self._forced_drives(src, dst))
+            self._forced_set[src][dst] = res
+        return res
+
+    def _reach_forced(self, truck_locs, loc):
+        """Directions EVERY truck must drive to reach loc: the intersection over
+        the trucks' locations of their forced directions toward loc. Cached by
+        (truck locations, loc), since most moves leave both unchanged."""
+        key = (truck_locs, loc)
+        res = self._reach_cache.get(key)
+        if res is None:
+            inter = None
+            for tl in truck_locs:
+                f = self._forced_drives_set(tl, loc)
+                inter = f if inter is None else (inter & f)
+                if not inter:
+                    break
+            res = tuple(inter) if inter else ()
+            if len(self._reach_cache) > 500000:
+                self._reach_cache.clear()
+            self._reach_cache[key] = res
+        return res
+
+    def _mst_bound(self, points, start_cost, beat=-1):
         """Minimum spanning tree over the trucks and the points that some truck
         must still visit (Prim's algorithm).
 
@@ -382,11 +498,18 @@ class LogisticsProblem(search.Problem):
         points     - set of locations to connect
         start_cost - start_cost(x): cheapest no-sail cost for any truck to reach
                      x; all trucks are in the tree from the start, so this is the
-                     initial key of every point."""
+                     initial key of every point.
+        beat       - only the result matters if it is larger than this. Joining
+                     every point straight to its closest truck is one spanning
+                     tree, so the sum of the initial keys is an upper bound on
+                     the MST; if that is <= beat, the MST cannot win and 0 is
+                     returned without building it."""
         if not points:
             return 0
         dist_ns = self.dist_no_sail
         key = {x: start_cost(x) for x in points}
+        if sum(key.values()) <= beat:
+            return 0
         total = 0
         while key:
             x = min(key, key=key.get)
@@ -399,7 +522,13 @@ class LogisticsProblem(search.Problem):
         return total
 
     def _sail_lower_bound(self, remaining_islands, ferry_port):
-        """Lower bound on the number of SAIL actions still needed.
+        """Returns (lower bound on SAIL actions still needed, lower bound on truck
+        rides still needed).
+        Rides: every package that changes island rides in trucks on ferries, at
+        least island_rides(i, j) times, and one ride carries at most C_max
+        weight, so rides >= ceil(sum(weight * rides) / C_max). The forced-crossing
+        ride count (below) is another lower bound; the larger one is returned.
+        Lower bound on the number of SAIL actions:
         remaining_islands - list of (current island, goal island, weight) of the
                             undelivered packages.
         1. Every crossing forced for some packages needs SAILs of its own, and
@@ -414,11 +543,16 @@ class LogisticsProblem(search.Problem):
         # at least hops(i, j) SAILs, so sum(weight * hops) is the weight-sails
         # still to do, and one SAIL does at most max_sail_capacity of them.
         workload = 0
+        ride_workload = 0
         for i, j, w in remaining_islands:
             if i != j:
                 workload += w * self.island_hops[i][j]
+                ride_workload += w * self.island_rides[i][j]
         cap = self.max_sail_capacity
         by_workload = -(-workload // cap) if cap > 0 and workload else 0
+        c_max = self.max_truck_capacity
+        rides_by_workload = (-(-ride_workload // c_max)
+                             if c_max > 0 and ride_workload else 0)
 
         # Bound 2: forced crossings (below). Both bound the total number of
         # SAILs, so the answer is the larger of the two.
@@ -428,7 +562,20 @@ class LogisticsProblem(search.Problem):
                 for c in self.forced.get((i, j), ()):
                     needed[c] = needed.get(c, 0) + w
         if not needed:
-            return by_workload
+            return by_workload, rides_by_workload
+
+        # Truck rides: a forced crossing with weight W needs ceil(W / C_max) rides.
+        # Crossings in one group may share rides (take the max); different
+        # groups never do (add them up).
+        group_rides = {}
+        for c, weight in needed.items():
+            r = -(-weight // c_max) if c_max > 0 else 1
+            g = self.crossing_group[c]
+            if r > group_rides.get(g, 0):
+                group_rides[g] = r
+        rides = sum(group_rides.values())
+        if rides_by_workload > rides:
+            rides = rides_by_workload
         sails = 0
         for c, weight in needed.items():
             per_sail = self.crossing_capacity[c]
@@ -443,7 +590,7 @@ class LogisticsProblem(search.Problem):
             if not any(island[ferry_port[f]] == x for f in self.crossing_ferries[(x, y)]):
                 late.add(x)
         by_forced = sails + len(late)
-        return by_forced if by_forced > by_workload else by_workload
+        return (by_forced if by_forced > by_workload else by_workload), rides
 
     @staticmethod
     def _replace(entries, i, obj_id, new_pos):
@@ -460,8 +607,24 @@ class LogisticsProblem(search.Problem):
 
     def h_astar(self, node):
         """ This is the heuristic. It gets a node (not a state)
-        and returns a goal distance estimate"""
-        packages, trucks, ferries = node.state
+        and returns a goal distance estimate.
+
+        The same state is often generated many times (from different parents),
+        so the value is memoized per state. This only avoids recomputing the
+        same number: the value for every state is exactly _h_value(state), and
+        no states are explored here (only states the search generated)."""
+        state = node.state
+        h = self._h_cache.get(state)
+        if h is None:
+            h = self._h_value(state)
+            if len(self._h_cache) > 3000000:     # bound memory use
+                self._h_cache.clear()
+            self._h_cache[state] = h
+        return h
+
+    def _h_value(self, state):
+        """The heuristic value of a state (see h_astar)."""
+        packages, trucks, ferries = state
         ferry_port = dict(ferries)
         dist = self.dist
         dist_ns = self.dist_no_sail
@@ -508,64 +671,57 @@ class LogisticsProblem(search.Problem):
 
         island = self.island
         load_unload = 0     # sum over packages: LOAD/UNLOAD actions still needed
-        # Version A (sails inside the movement terms)
-        movement = 0        # max over packages: truck -> package -> goal
-        shared_max = 0      # max over non-solo packages: carried trip, full cost
-        # Version B (movement terms without any SAIL, sails counted separately)
-        movement_ns = 0
-        shared_max_ns = 0
-        solo_sum = 0        # sum over solo packages: carried trip, no sails (both)
+        # Movement terms without any SAIL (sails are counted separately)
+        movement_ns = 0     # max over packages: truck -> package -> goal
+        shared_max_ns = 0   # max over non-solo packages: carried trip
+        solo_sum = 0        # sum over solo packages: carried trip
+        # Same two, counting DRIVE actions only (crossings free)
+        dist_drive = self.dist_drive
+        shared_max_drive = 0
+        solo_sum_drive = 0
         islands = []        # (current island, goal island) per remaining package
         # directed cut road -> total weight of packages forced through it.
         # A direction with weight 0 is one some truck must drive just to reach
         # a package.
         forced = {}
         must_visit = set()  # locations some truck must still stand at
-        truck_locs = {truck_at[t][0] for t in self.truck_ids}
+        truck_locs = frozenset(truck_at[t][0] for t in self.truck_ids)
+        forced_get = forced.get
         for p, w, pos in remaining:
             goal = self.package_goal[p]
             if pos[0] == self.AT:
                 loc = pos[1]
                 load_unload += 2                                # LOAD + UNLOAD
-                reach = min(truck_dist(t, loc, dist, 3) for t in self.truck_ids)
                 reach_ns = min(truck_dist(t, loc, dist_ns, 0) for t in self.truck_ids)
-                carried = dist[loc][goal]
                 carried_ns = dist_ns[loc][goal]
-                need = reach + carried                          # truck -> package -> goal
-                need_ns = reach_ns + carried_ns
+                carried_drive = dist_drive[loc][goal]
+                need_ns = reach_ns + carried_ns                 # truck -> package -> goal
                 here = island[loc]
                 # Cut roads EVERY truck must cross to reach this package: some
                 # truck has to drive them toward the package.
-                to_pkg = None
-                for tl in truck_locs:
-                    f = self._forced_drives(tl, loc)
-                    to_pkg = f if to_pkg is None else (to_pkg & f)
-                    if not to_pkg:
-                        break
-                if to_pkg:
-                    for d in to_pkg:
-                        if d not in forced:
-                            forced[d] = 0
+                for d in self._reach_forced(truck_locs, loc):
+                    if d not in forced:
+                        forced[d] = 0
             else:
                 t = pos[1]
                 load_unload += 1                                # UNLOAD
-                carried = truck_dist(t, goal, dist, 3)
                 carried_ns = truck_dist(t, goal, dist_ns, 0)
-                need = carried                                  # its truck -> goal
-                need_ns = carried_ns
+                # Drives only: a truck aboard a ferry is at the ferry's port and
+                # crossings are free in dist_drive, so no DISEMBARK is added here
+                # (it is counted in board_disembark)
+                carried_drive = dist_drive[truck_at[t][0]][goal]
+                need_ns = carried_ns                            # its truck -> goal
                 loc = truck_at[t][0]
                 here = island[loc]
             # Cut roads every route of this package to its goal uses: the
             # package's weight must be carried across each of them
             for d in self._forced_drives(loc, goal):
-                forced[d] = forced.get(d, 0) + w
+                forced[d] = forced_get(d, 0) + w
             # A truck must stand at the goal to UNLOAD, and at a lying package's
             # location to LOAD it
             must_visit.add(goal)
             if pos[0] == self.AT:
                 must_visit.add(loc)
-            if need > movement:
-                movement = need
             if need_ns > movement_ns:
                 movement_ns = need_ns
             islands.append((here, island[goal], w))
@@ -576,29 +732,19 @@ class LogisticsProblem(search.Problem):
             other_min = second_w if w == min_w else min_w
             if other_min is not None and w + other_min > cap:
                 solo_sum += carried_ns
+                solo_sum_drive += carried_drive
             else:
-                if carried > shared_max:
-                    shared_max = carried
                 if carried_ns > shared_max_ns:
                     shared_max_ns = carried_ns
+                if carried_drive > shared_max_drive:
+                    shared_max_drive = carried_drive
 
-        # Version A: carried trips of different solo packages, and of one
-        # non-solo package, never share a DRIVE/BOARD/DISEMBARK. Sails are counted
-        # only for the non-solo one, so no SAIL is counted twice.
-        movement = max(movement, solo_sum + shared_max)
-        h_a = load_unload + movement
-
-        # Version B: LOAD/UNLOAD + DRIVE/BOARD/DISEMBARK (no sails) + SAILs.
+        # h = LOAD/UNLOAD + DRIVE/BOARD/DISEMBARK (no sails) + SAILs.
         # The three parts count different action types, so they can be added.
-        # Every directed cut road in `forced` needs its own DRIVE action (one
-        # drive can serve many packages, so each is counted once). This and the
-        # other movement terms all bound DRIVE/BOARD/DISEMBARK, so take the max.
-        # MST over trucks + places to visit: also a bound on DRIVE/BOARD/DISEMBARK
-        # (no sails), so it joins the same max.
+        # The DRIVE/BOARD/DISEMBARK part is the max of several lower bounds.
+        # Carried trips of different solo packages, and of one non-solo package,
+        # never share a DRIVE/BOARD/DISEMBARK, so they can be added.
         truck_ids = self.truck_ids
-        mst = self._mst_bound(
-            must_visit,
-            lambda x: min(truck_dist(t, x, dist_ns, 0) for t in truck_ids))
         # Forced drives: one DRIVE across a road carries at most the biggest
         # truck capacity, so a direction that W weight must cross needs at least
         # ceil(W / cap) DRIVE actions (at least 1 if a truck must use it at all).
@@ -610,11 +756,33 @@ class LogisticsProblem(search.Problem):
                 forced_drives += trips if trips > 1 else 1
         else:
             forced_drives = len(forced)
-        movement_ns = max(movement_ns, solo_sum + shared_max_ns, forced_drives, mst)
-        sails = self._sail_lower_bound(islands, ferry_port)
-        h_b = load_unload + movement_ns + 3 * sails
+        sails, rides = self._sail_lower_bound(islands, ferry_port)
+        # Every ride ends with a DISEMBARK and starts with a BOARD, except rides
+        # already under way (at most one per truck already aboard a ferry).
+        aboard = sum(1 for t in truck_ids if truck_at[t][1] is not None)
+        board_disembark = 2 * rides - aboard
+        if board_disembark < 0:
+            board_disembark = 0
+        # forced_drives (DRIVE) + board_disembark (BOARD/DISEMBARK) count
+        # different actions, so together they are one more movement candidate.
+        # DRIVE-only bounds: forced drives, and the drives of carried trips that
+        # cannot share a DRIVE (solo packages + one non-solo). Both count only
+        # DRIVE actions, so take the max; then add BOARD/DISEMBARK, a different
+        # action type.
+        drive_bound = max(forced_drives, solo_sum_drive + shared_max_drive)
+        movement_ns = max(movement_ns, solo_sum + shared_max_ns,
+                          drive_bound + board_disembark)
+        # MST over trucks + places to visit: also a bound on DRIVE/BOARD/DISEMBARK
+        # (no sails), so it joins the same max. It is only built when it could
+        # beat the current best (see _mst_bound).
+        mst = self._mst_bound(
+            must_visit,
+            lambda x: min(truck_dist(t, x, dist_ns, 0) for t in truck_ids),
+            movement_ns)
+        if mst > movement_ns:
+            movement_ns = mst
 
-        return h_a if h_a > h_b else h_b
+        return load_unload + movement_ns + 3 * sails
 
 
 def create_logistics_problem(game):
