@@ -1,71 +1,36 @@
-# AI AND SOURCE DISCLOSURE (Assignment1.pdf, section 10)
+# AI AND SOURCE DISCLOSURE
+# Codex and Claude helped tackle the problem through research, deriving ideas
+# from papers, and writing, debugging and testing code.
+# Also they helped me undertand which ideas works and which do not, and how to implement them.
 #
-# Direct AI assistance:
-# OpenAI Codex was used throughout this implementation: interpreting the task;
-# designing the immutable state and legal action generation; deriving and
-# implementing relaxed-distance, capacity, cut/flow, visit-forest, conditional
-# transfer and cargo-pattern bounds; implementing symmetry and partial-order
-# successor reductions; writing/revising code; debugging cache/admissibility
-# issues; profiling and optimizing; and writing exact-cost regression tests and
-# checking their results. Codex also searched for and explained related sources.
-# No exact underlying model version is asserted here.
-#
-# Adapted code and inherited AI assistance:
-# Cargo-pattern/Bellman-table code and complementary road-cost, small-truck,
-# capable-pickup, visit-forest and caching ideas were adapted from the user's own
-# codex/logistics-cargo-pdb worktree. That source credits Claude and OpenAI Codex
-# for design, heuristics, pruning, implementation and testing. Claude's exact
-# model version and individual contributions are not established in this chat.
-# The adaptations were fitted to this file's state encoding and audited/tested
-# with Codex; the source worktree was inspected without modifying it.
-#
-# Sources directly consulted in this chat, and how they were used:
-# - Skopek and Bartak, TransportEditor (ICAPS 2017 demo): Transport-domain
-#   background and comparison of truck delivery, capacity and load/unload rules.
+# Sources used for related problems and heuristic/pruning ideas:
+# - TransportEditor (Skopek and Bartak, ICAPS 2017):
 #   https://oskopek.com/docs/ICAPS17-TransportEditor-Demo.pdf
-# - CSU Planning Repository, UCPOP Ferry/Logistics domains: locating related
-#   domain/problem files and comparing ferry and package-delivery mechanics.
+# - CSU Planning Repository, Ferry/Logistics domains:
 #   https://www.cs.colostate.edu/meps/repository/ucpop.html
-# - Official IPC 2002 domain descriptions, especially numeric Depots:
-#   comparison of weighted cargo and truck-capacity constraints.
+# - IPC 2002 domains, especially numeric Depots:
 #   https://ipc02.icaps-conference.org/domains.html
-# - CTU planning exercise: conceptual comparison with a cargo/car/airplane
-#   assignment. Only its search-result description was available; fetching the
-#   complete page failed during this chat.
+# - CTU planning exercise (search-result description only):
 #   https://cw.fel.cvut.cz/old/courses/ae3b33kui/seminars_and_labs/11
-# - AI-Planning PDDL generators: discovery of Ferry, Transport, Logistics,
-#   Depots and Trucks benchmark generators for related practice problems.
+# - AI-Planning PDDL benchmark generators:
 #   https://github.com/AI-Planning/pddl-generators
-# - Planning.Domains API: discovery of related PDDL benchmark collections.
+# - Planning.Domains benchmark collections:
 #   https://api.planning.domains/
-# - IBM ACPBench: reference examples/descriptions of action applicability,
-#   state transitions and plan validation while researching related tasks.
+# - IBM ACPBench, action applicability and plan validation:
 #   https://ibm.github.io/ACPBench/
-# - Wehrle and Helmert, Efficient Stubborn Sets: Generalized Algorithms and
-#   Selection Strategies (ICAPS 2014): read for the necessary-enabling-set and
-#   interference conditions used to adapt strong stubborn-set successor pruning.
+# - Efficient Stubborn Sets (Wehrle and Helmert, ICAPS 2014):
 #   https://ai.dmi.unibas.ch/papers/wehrle-helmert-icaps2014.pdf
-#
-# - Wehrle et al., Integrating Partial Order Reduction and Symmetry Elimination
-#   (IJCAI 2015): consulted for the optimality-preserving combination of strong
-#   stubborn sets and state symmetry during the successor-pruning audit.
+# - Integrating Partial Order Reduction and Symmetry Elimination
+#   (Wehrle et al., IJCAI 2015):
 #   https://ijcai.org/proceedings/2015/0244.pdf
-# - Pommerening, Roeger and Helmert, Getting the Most Out of Pattern Databases
-#   (IJCAI 2013): proceedings abstract consulted while investigating stronger
-#   cargo patterns. A joint-pattern experiment was discarded after timing it.
+# - Getting the Most Out of Pattern Databases (Pommerening et al.,
+#   IJCAI 2013; proceedings abstract consulted):
 #   https://ijcai.org/proceedings/2013/347
-#
-# References inherited from the adapted worktree's disclosure (not directly
-# read in this chat; retained here to preserve that code's stated provenance):
-# - Paul et al., SOCS 2017, as cited by the adapted implementation.
+# - References inherited from the adapted branch (not read directly here):
+#   Paul et al., SOCS 2017:
 #   https://ojs.aaai.org/index.php/SOCS/article/download/18428/18219/21944
-# - Felner, Korf and Hanan, Additive Pattern Database Heuristics:
-#   abstraction and disjoint cost partitioning, as cited by the adapted code.
+#   Additive Pattern Database Heuristics (Felner, Korf and Hanan):
 #   https://arxiv.org/abs/1107.0050
-#
-# The supplied A*, priority queue and action-cost behavior are used unchanged.
-# The constructor builds relaxed abstract lower bounds, not stored real plans;
-# the implementation does not detect problem names or return memorized answers.
 
 from collections import OrderedDict
 import itertools
@@ -79,7 +44,7 @@ except ImportError:
 
 import search
 
-id = ["No numbers - I'm special!"]
+id = ["211397054"]
 
 
 class _CargoPattern:
